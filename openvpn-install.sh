@@ -323,7 +323,7 @@ show_client_add_help() {
 
 show_client_list_help() {
 	cat <<-EOF
-		List all client certificates
+		List all client certificates, with the static IP of the clients that have one
 
 		Usage: $SCRIPT_NAME client list [options]
 
@@ -4382,6 +4382,13 @@ function json_escape() {
 	printf '%s' "$str"
 }
 
+# Static IPv4 address pinned to a client through its ccd file (empty if none)
+function getClientStaticIp() {
+	local ccd_file="/etc/openvpn/server/ccd/$1"
+	[[ -f "$ccd_file" ]] || return 0
+	awk '$1 == "ifconfig-push" { print $2; exit }' "$ccd_file"
+}
+
 function listClients() {
 	local index_file="/etc/openvpn/server/easy-rsa/pki/index.txt"
 	local cert_dir="/etc/openvpn/server/easy-rsa/pki/issued"
@@ -4434,7 +4441,9 @@ function listClients() {
 			fi
 			local expiry_info
 			expiry_info=$(getCertExpiry "$cert_dir/$client_name.crt")
-			clients_data+=("$client_name|$status_text|$expiry_info")
+			local static_ip=""
+			[[ $status_text == "valid" ]] && static_ip=$(getClientStaticIp "$client_name")
+			clients_data+=("$client_name|$status_text|$expiry_info|$static_ip")
 		done
 	else
 		# PKI mode: get clients from index.txt
@@ -4466,7 +4475,9 @@ function listClients() {
 
 			local expiry_info
 			expiry_info=$(getCertExpiry "$cert_dir/$client_name.crt")
-			clients_data+=("$client_name|$status_text|$expiry_info")
+			local static_ip=""
+			[[ $status_text == "valid" ]] && static_ip=$(getClientStaticIp "$client_name")
+			clients_data+=("$client_name|$status_text|$expiry_info|$static_ip")
 		done < <(tail -n +2 "$index_file" | grep "^[VR]" | grep -v "/CN=server_" | sort -t$'\t' -k2)
 	fi
 
@@ -4475,7 +4486,7 @@ function listClients() {
 		echo '{"clients":['
 		local first=true
 		for client_entry in "${clients_data[@]}"; do
-			IFS='|' read -r name status expiry days <<<"$client_entry"
+			IFS='|' read -r name status expiry days static_ip <<<"$client_entry"
 			[[ $first == true ]] && first=false || printf ','
 			# Handle null for days_remaining (no quotes for JSON null)
 			local days_json
@@ -4484,8 +4495,10 @@ function listClients() {
 			else
 				days_json="$days"
 			fi
-			printf '{"name":"%s","status":"%s","expiry":"%s","days_remaining":%s}\n' \
-				"$(json_escape "$name")" "$(json_escape "$status")" "$(json_escape "$expiry")" "$days_json"
+			local static_ip_json="null"
+			[[ -n "$static_ip" ]] && static_ip_json="\"$(json_escape "$static_ip")\""
+			printf '{"name":"%s","status":"%s","expiry":"%s","days_remaining":%s,"static_ip":%s}\n' \
+				"$(json_escape "$name")" "$(json_escape "$status")" "$(json_escape "$expiry")" "$days_json" "$static_ip_json"
 		done
 		echo ']}'
 	else
@@ -4493,11 +4506,11 @@ function listClients() {
 		log_header "Client Certificates"
 		log_info "Found $number_of_clients client certificate(s)"
 		log_menu ""
-		printf "   %-25s %-10s %-12s %s\n" "Name" "Status" "Expiry" "Remaining"
-		printf "   %-25s %-10s %-12s %s\n" "----" "------" "------" "---------"
+		printf "   %-25s %-10s %-12s %-14s %s\n" "Name" "Status" "Expiry" "Remaining" "Static IP"
+		printf "   %-25s %-10s %-12s %-14s %s\n" "----" "------" "------" "---------" "---------"
 
 		for client_entry in "${clients_data[@]}"; do
-			IFS='|' read -r name status expiry days <<<"$client_entry"
+			IFS='|' read -r name status expiry days static_ip <<<"$client_entry"
 			local relative
 			if [[ $days == "null" ]]; then
 				relative="unknown"
@@ -4512,7 +4525,7 @@ function listClients() {
 			fi
 			# Capitalize status for table display
 			local status_display="${status^}"
-			printf "   %-25s %-10s %-12s %s\n" "$name" "$status_display" "$expiry" "$relative"
+			printf "   %-25s %-10s %-12s %-14s %s\n" "$name" "$status_display" "$expiry" "$relative" "${static_ip:--}"
 		done
 		log_menu ""
 	fi
