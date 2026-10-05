@@ -213,6 +213,8 @@ show_install_help() {
 			--no-client-ipv6      Disable IPv6 for VPN clients (default)
 			--subnet-ipv4 <x.x.x.0>  IPv4 VPN subnet (default: 10.8.0.0)
 			--subnet-ipv6 <prefix>   IPv6 VPN subnet (default: fd42:42:42:42::)
+			--static-ips <n>      Reserve the first n IPv4 addresses for static clients;
+				the rest is allocated dynamically (default: 0)
 			--route-internet      Route client internet traffic through VPN (default)
 			--no-route-internet   Keep client internet traffic outside VPN
 			--client-to-client    Allow VPN clients to access each other
@@ -262,6 +264,7 @@ show_install_help() {
 			$SCRIPT_NAME install
 			$SCRIPT_NAME install --port 443 --protocol tcp
 			$SCRIPT_NAME install --dns quad9 --cipher AES-256-GCM
+			$SCRIPT_NAME install --subnet-ipv4 10.8.0.0 --static-ips 50
 			$SCRIPT_NAME install -i
 	EOF
 }
@@ -307,11 +310,14 @@ show_client_add_help() {
 			--password [pass]   Password-protect client (prompts if no value given)
 			--cert-days <n>     Certificate validity in days (default: 3650)
 			--output <path>     Output path for .ovpn file (default: ~/<name>.ovpn)
+			--static-ip <ip>    Assign a fixed IPv4 address from the reserved static range
+				(requires install --static-ips)
 
 		Examples:
 			$SCRIPT_NAME client add alice
 			$SCRIPT_NAME client add bob --password
 			$SCRIPT_NAME client add charlie --cert-days 365 --output /tmp/charlie.ovpn
+			$SCRIPT_NAME client add dave --static-ip 10.8.0.10
 	EOF
 }
 
@@ -513,6 +519,7 @@ set_installation_defaults() {
 	CLIENT_IPV6="${CLIENT_IPV6:-n}"
 	VPN_SUBNET_IPV4="${VPN_SUBNET_IPV4:-10.8.0.0}"
 	VPN_SUBNET_IPV6="${VPN_SUBNET_IPV6:-fd42:42:42:42::}"
+	STATIC_IPS="${STATIC_IPS:-0}"
 	ROUTE_INTERNET="${ROUTE_INTERNET:-y}"
 	CLIENT_TO_CLIENT="${CLIENT_TO_CLIENT:-n}"
 	LOCAL_NETWORKS="${LOCAL_NETWORKS:-}"
@@ -594,6 +601,41 @@ validate_subnet_ipv4() {
 		[[ "$octet1" -eq 172 && "$octet2" -ge 16 && "$octet2" -le 31 ]] ||
 		[[ "$octet1" -eq 192 && "$octet2" -eq 168 ]]; }; then
 		log_fatal "Invalid IPv4 subnet: $subnet. Must be a private network (10.x.x.0, 172.16-31.x.0, or 192.168.x.0)."
+	fi
+}
+
+# Number of addresses reserved for static clients at the start of the /24.
+# The gateway uses .1, so n addresses cover .2 to .(n+1); 252 leaves .254 for the pool.
+validate_static_ips() {
+	local count="$1"
+	if ! [[ "$count" =~ ^[0-9]+$ ]] || [[ "$((10#$count))" -gt 252 ]]; then
+		log_fatal "Invalid static IP count: $count. Must be a number between 0 and 252."
+	fi
+}
+
+# Check that a static client IP is inside the reserved range and not yet assigned
+validate_client_static_ip() {
+	local ip="$1"
+	local subnet pool_start prefix host ccd_file
+
+	subnet=$(grep '^server ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	pool_start=$(grep '^ifconfig-pool ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+	if [[ -z $subnet ]] || [[ -z $pool_start ]]; then
+		log_fatal "No static IP range is reserved on this server. Install with --static-ips <n> to reserve one."
+	fi
+
+	prefix="${subnet%.*}"
+	if ! [[ "$ip" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.(0|[1-9][0-9]{0,2})$ ]] || [[ "${BASH_REMATCH[1]}" != "$prefix" ]]; then
+		log_fatal "Invalid static IP: $ip. Must be an address in the VPN subnet $subnet/24."
+	fi
+	host="${BASH_REMATCH[2]}"
+	if [[ "$host" -lt 2 ]] || [[ "$host" -ge "${pool_start##*.}" ]]; then
+		log_fatal "Static IP $ip is outside the reserved range $prefix.2-$prefix.$((${pool_start##*.} - 1))."
+	fi
+
+	ccd_file=$(grep -l -s -E "^ifconfig-push $prefix\.$host " /etc/openvpn/server/ccd/* | head -n 1)
+	if [[ -n $ccd_file ]]; then
+		log_fatal "Static IP $ip is already assigned to client $(basename "$ccd_file")."
 	fi
 }
 
@@ -1063,6 +1105,13 @@ validate_configuration() {
 	if [[ $CLIENT_IPV6 == "y" ]] && [[ -n $VPN_SUBNET_IPV6 ]]; then
 		validate_subnet_ipv6 "$VPN_SUBNET_IPV6"
 	fi
+
+	# Validate the static IP reservation
+	validate_static_ips "$STATIC_IPS"
+	STATIC_IPS=$((10#$STATIC_IPS))
+	if [[ $STATIC_IPS -gt 0 ]] && [[ $MULTI_CLIENT == "y" ]]; then
+		log_fatal "--static-ips cannot be combined with --multi-client: devices sharing a certificate would get the same static IP."
+	fi
 }
 
 # =============================================================================
@@ -1257,6 +1306,12 @@ cmd_install() {
 			[[ -z "${2:-}" ]] && log_fatal "--subnet-ipv6 requires an argument"
 			validate_subnet_ipv6 "$2"
 			VPN_SUBNET_IPV6="$2"
+			shift 2
+			;;
+		--static-ips)
+			[[ -z "${2:-}" ]] && log_fatal "--static-ips requires an argument"
+			validate_static_ips "$2"
+			STATIC_IPS="$2"
 			shift 2
 			;;
 		--subnet)
@@ -1598,6 +1653,11 @@ cmd_client_add() {
 			CLIENT_FILEPATH="$2"
 			shift 2
 			;;
+		--static-ip)
+			[[ -z "${2:-}" ]] && log_fatal "--static-ip requires an argument"
+			CLIENT_STATIC_IP="$2"
+			shift 2
+			;;
 		-h | --help)
 			show_client_add_help
 			exit 0
@@ -1620,6 +1680,10 @@ cmd_client_add() {
 	validate_client_name "$client_name"
 
 	requireOpenVPN
+
+	if [[ -n "${CLIENT_STATIC_IP:-}" ]]; then
+		validate_client_static_ip "$CLIENT_STATIC_IP"
+	fi
 
 	# Set up variables for newClient function
 	CLIENT="$client_name"
@@ -3014,6 +3078,7 @@ function installOpenVPN() {
 		log_info "  CLIENT_IPV6=$CLIENT_IPV6"
 		log_info "  VPN_SUBNET_IPV4=$VPN_SUBNET_IPV4"
 		log_info "  VPN_SUBNET_IPV6=$VPN_SUBNET_IPV6"
+		log_info "  STATIC_IPS=$STATIC_IPS"
 		log_info "  ROUTE_INTERNET=$ROUTE_INTERNET"
 		log_info "  CLIENT_TO_CLIENT=$CLIENT_TO_CLIENT"
 		log_info "  LOCAL_NETWORKS=${LOCAL_NETWORKS:-none}"
@@ -3267,7 +3332,14 @@ topology subnet" >>/etc/openvpn/server/server.conf
 
 	# IPv4 server directive - always assign IPv4 to clients for proper routing
 	# Even for IPv6-only mode, we need IPv4 addresses so redirect-gateway def1 can block IPv4 leaks
-	echo "server $VPN_SUBNET_IPV4 255.255.255.0" >>/etc/openvpn/server/server.conf
+	# With a static reservation, the first STATIC_IPS addresses after the gateway are kept
+	# out of the dynamic pool and assigned per client with ifconfig-push in the ccd files
+	if [[ ${STATIC_IPS:-0} -gt 0 ]]; then
+		echo "server $VPN_SUBNET_IPV4 255.255.255.0 nopool
+ifconfig-pool ${VPN_SUBNET_IPV4%.*}.$((STATIC_IPS + 2)) ${VPN_SUBNET_IPV4%.*}.254 255.255.255.0" >>/etc/openvpn/server/server.conf
+	else
+		echo "server $VPN_SUBNET_IPV4 255.255.255.0" >>/etc/openvpn/server/server.conf
+	fi
 
 	# IPv6 server directive (only if clients get IPv6)
 	if [[ $CLIENT_IPV6 == "y" ]]; then
@@ -3506,6 +3578,7 @@ verb 3"
 		echo "LOCAL_NETWORKS=$LOCAL_NETWORKS"
 		echo "CLIENT_IPV4=$CLIENT_IPV4"
 		echo "CLIENT_IPV6=$CLIENT_IPV6"
+		echo "STATIC_IPS=${STATIC_IPS:-0}"
 	} >/etc/openvpn/server/openvpn-install.conf
 	chmod 600 /etc/openvpn/server/openvpn-install.conf
 
@@ -4656,6 +4729,14 @@ $CLIENT_FINGERPRINT
 		fi
 	fi
 
+	# Pin the client to its static IP (ccd files are read at connect time, no reload needed)
+	if [[ -n "${CLIENT_STATIC_IP:-}" ]]; then
+		echo "ifconfig-push $CLIENT_STATIC_IP 255.255.255.0" >"/etc/openvpn/server/ccd/$CLIENT"
+		chown --reference=/etc/openvpn/server/ccd "/etc/openvpn/server/ccd/$CLIENT"
+		chmod 644 "/etc/openvpn/server/ccd/$CLIENT"
+		log_info "Static IP $CLIENT_STATIC_IP assigned to client $CLIENT."
+	fi
+
 	log_success "Client $CLIENT added and is valid for $CLIENT_CERT_DURATION_DAYS days."
 
 	# Write the .ovpn config file with proper path and permissions
@@ -4704,6 +4785,7 @@ function revokeClient() {
 	run_cmd "Removing client config from /home" find /home/ -maxdepth 2 -name "$CLIENT.ovpn" -delete
 	run_cmd "Removing client config from /root" rm -f "/root/$CLIENT.ovpn"
 	run_cmd "Removing IP assignment" sed -i "/^$CLIENT,.*/d" /etc/openvpn/server/ipp.txt
+	run_cmd "Removing static IP assignment" rm -f "/etc/openvpn/server/ccd/$CLIENT"
 
 	# Disconnect the client if currently connected
 	disconnectClient "$CLIENT"
