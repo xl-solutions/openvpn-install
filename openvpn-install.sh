@@ -4033,6 +4033,11 @@ setenv opt block-outside-dns # Prevent Windows 10 DNS leak
 verb 3"
 	} >>/etc/openvpn/server/client-template.txt
 
+	# Split tunnel: clients ignore any DNS server pushed by the server and keep their own
+	if [[ $ROUTE_INTERNET == "n" ]]; then
+		echo 'pull-filter ignore "dhcp-option DNS"' >>/etc/openvpn/server/client-template.txt
+	fi
+
 	if [[ -n $MTU ]]; then
 		echo "tun-mtu $MTU" >>/etc/openvpn/server/client-template.txt
 	fi
